@@ -335,7 +335,7 @@ If time is short, cut inside L7 and the optional parts of L4 (YouTube comments, 
 
 Open questions: exact time available before round 2, which LLM provider to start with, which regional languages to support first, and who owns the classifier work.
 
-## 21. Round 1 presentation outline
+## 21.  Round 1 presentation outline
 
 1. The problem, with real recent cases.
 2. Why existing tools fall short (a verdict without evidence, no student focus).
