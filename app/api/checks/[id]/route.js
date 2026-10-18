@@ -1,3 +1,4 @@
+// PROVISIONAL: built early, audited in layer L6 backend
 import { getCheck } from "@/lib/db/index.js";
 
 export async function GET(request, { params }) {

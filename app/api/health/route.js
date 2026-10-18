@@ -1,3 +1,4 @@
+// PROVISIONAL: built early, audited in layer L6 backend
 import { z } from "zod";
 import { generate } from "@/lib/llm/generate.js";
 import { getEnv } from "@/lib/env.js";

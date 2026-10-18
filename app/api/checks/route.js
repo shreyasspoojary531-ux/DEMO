@@ -1,3 +1,4 @@
+// PROVISIONAL: built early, audited in layer L6 backend
 import crypto from "node:crypto";
 import { z } from "zod";
 import { createCheck } from "@/lib/db/index.js";

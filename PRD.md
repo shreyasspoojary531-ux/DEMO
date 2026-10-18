@@ -73,6 +73,8 @@ At least one of text, image or link is required. All other fields are optional. 
 
 ## 4. Website structure and routes
 
+**Build scope:** backend first. The API routes and the live progress stream are built first. The pages below are specified now and built after the backend passes its gates.
+
 | Route | Purpose |
 |---|---|
 | `/` | Landing page: what the tool does, example scams, a "Check an offer" button |
@@ -93,7 +95,7 @@ A check moves through these states: `created`, `extracting`, `awaiting_confirmat
 1. **Submit.** The user opens `/check`, adds inputs and ticks the consent box ("I understand this is a risk assessment, not a legal verdict"). The frontend calls `POST /api/checks`.
 2. **Extraction.** The backend stores the inputs and starts extraction: a vision model reads each screenshot (messages, sender label, timestamps, links, amounts, payment IDs) and regex finds URLs, UPI IDs, emails, amounts and phone numbers in all text.
 3. **Confirm.** The user lands on `/check/[id]` in the `awaiting_confirmation` state and sees what was read: the conversation text and a list of detected entities (domains, UPI IDs, company names, handles). They can edit, delete or add items. This prevents wrong readings from corrupting the report. They click "Start check".
-4. **Investigation.** The frontend calls `POST /api/checks/:id/confirm`. The orchestrator starts all agents in parallel. The page shows a live timeline (for example "Checking website... done", "Searching for reports... in progress") using server-sent events or polling.
+4. **Investigation.** The frontend calls `POST /api/checks/:id/confirm`. The main agent (coordinator) reads the case file, runs every specialist agent that has something to check in parallel, and skips the others with a reason. If an agent discovers new items (for example a linked domain), a second round runs for the agents they make eligible. The page shows a live timeline (for example "Checking website... done", "Payment check... skipped: no payment ID") using server-sent events or polling.
 5. **Scoring.** When agents finish or time out, the scoring engine combines flags and the classifier output into a risk level.
 6. **Report.** The report writer produces the explanation, checklist and recommended actions in the chosen language.
 7. **Act.** The user can open any source link, copy the checklist, generate a draft email to the college or placement cell, open the "I already paid" help, or mark the report as right or wrong.
@@ -141,13 +143,15 @@ The design principle is **deterministic code for facts, LLM for reading and expl
 
 Timeouts: each agent has a 25-second limit. A timed-out agent returns a could_not_check status and lowers confidence instead of failing the whole check.
 
+**Case file and eligibility:** everything known about a check lives in one case file (inputs, entities, findings, events). The main agent runs only the agents whose input exists in the case file. For example, if the user submits only a chat screenshot, extraction runs first, and agents wake up only for what the screenshot contained. An agent with nothing to check returns skipped, which does not lower confidence; an agent that fails or times out returns could_not_check, which does. Agents never write to the case file; the main agent validates and merges their results. Up to 2 rounds run, so entities discovered in round 1 can trigger agents in round 2. See ARCHITECTURE.md section 3.
+
 ## 8. Agent specifications
 
-Every agent returns the same structure: agent name, status, a list of flags, a list of verified items, and notes. Each flag has an id, title, severity, explanation and evidence. Evidence is either a quoted snippet from the user's input or a source URL.
+Every agent returns the same structure: agent name, status (ok, skipped or could_not_check) with a reason, a list of flags, a list of verified items, any newly discovered entities, and notes. Each flag has an id from a fixed registry, a title, severity, explanation and evidence. Evidence is either a quoted snippet from the user's input or a source URL. Each agent also has a cheap rule (canRun) that decides whether it has anything to check.
 
-### 8.1 Orchestrator
+### 8.1 Coordinator (main agent)
 
-Starts all agents with `Promise.allSettled`, enforces timeouts, streams progress, and passes the merged results to scoring. It contains no AI of its own.
+Owns the case file. Runs extraction, then rounds: it evaluates which agents can run, starts them in parallel with `Promise.allSettled`, enforces timeouts, validates and merges their results, streams progress, and passes the merged findings to the scoring engine and then the report writer. It is plain code; the LLM is used only in extraction, inside agents that need language understanding, and in the report writer. Discovered entities are capped (5 per agent per round), normalized and marked as discovered, and the number of rounds is limited to 2.
 
 ### 8.2 Message Analyst
 
@@ -201,8 +205,8 @@ Plain code, fully explainable. The initial values below are starting points to t
 - The classifier probability adds up to 25 points.
 - **Hard rules override the sum:** a fee demand for a scholarship, any request to rent or hand over a bank account, SIM or ATM card, or a match with a known scam in the graph results in High.
 - **Thresholds:** below 25 is Low, 25 to 59 is Medium, 60 and above is High.
-- **Cannot verify:** if fewer than 40% of the relevant checks completed and the score is below 60, the outcome is Cannot verify, never Low.
-- **Confidence:** the share of relevant checks that completed, shown as Low, Medium or High confidence.
+- **Cannot verify:** if fewer than 40% of the eligible checks completed and the score is below 60, the outcome is Cannot verify, never Low. Skipped agents are not eligible and are not counted.
+- **Confidence:** the share of eligible checks that completed, shown as Low, Medium or High confidence. Skipped agents do not lower it; failed or timed-out agents do.
 
 ## 11. Report
 
@@ -216,7 +220,7 @@ The report returned by `GET /checks/:id/report` contains these fields:
 | summary | Plain-language summary in the chosen language |
 | flags | List of flags, each with title, severity, explanation and evidence (quote or source link) |
 | verified | Things that checked out (for example valid SSL) |
-| couldNotCheck | Checks that failed or were skipped |
+| couldNotCheck | Checks that failed or timed out. Checks that did not apply (skipped) are listed separately as not applicable |
 | checklist | What to verify next, step by step |
 | actions | Buttons to show: college email, fraud help |
 | disclaimer | Risk assessment based on public information, not a legal verdict |
@@ -240,12 +244,13 @@ The report writer must only use evidence supplied by the agents. If the evidence
 |---|---|
 | `checks` | id, status, language, risk_level, score, confidence, created_at, expires_at |
 | `check_inputs` | check_id, type (text, image, url, upi, company, handle, phone), value or temporary file reference |
-| `entities` | check_id, kind, value, source (extracted or user-added), confirmed |
-| `agent_results` | check_id, agent, status, flags_json, duration_ms |
+| `entities` | check_id, kind, value, source (extracted, user-added or discovered), discovered_by, round, confirmed |
+| `agent_results` | check_id, agent, round, kind, status (ok, skipped, could_not_check), reason, flags_json, new_entities_json, duration_ms |
+| `check_events` | check_id, round, type, agent, status, summary, created_at |
 | `reports` | check_id, report_json |
 | `graph_nodes` | id, kind, value, first_seen, report_count |
 | `graph_edges` | node_a, node_b, check_ref, created_at |
-| `feedback` | check_id, verdict, comment, created_at |
+| `feedback` | check_id (cleared when the check is deleted), verdict, risk_level_shown, comment, created_at |
 | `lookup_cache` | key, result_json, fetched_at, ttl |
 
 Retention: checks, inputs and reports are deleted after 24 hours. Uploaded images are deleted right after extraction. Only graph rows and anonymous feedback persist.
@@ -255,7 +260,7 @@ Retention: checks, inputs and reports are deleted after 24 hours. Uploaded image
 | Purpose | Service | Notes |
 |---|---|---|
 | LLM (text and vision) | Free-tier provider to start | Behind one generate wrapper so the provider can be swapped. Check current free-tier limits |
-| Web search and dorks | Search API (Google Programmable Search, Brave Search or similar) | Do not scrape results pages. Check quotas and cache results |
+| Web search and dorks | Serper (serper.dev), behind a swappable search wrapper | Returns Google results as JSON, so dorks can be tested directly. 2,500 free queries on signup. Do not scrape results pages ourselves. Cap queries per check and cache results |
 | Domain data | RDAP, DNS, crt.sh, Wayback Machine | Free |
 | Link safety | Google Safe Browsing, URLScan, VirusTotal | Free tiers, rate-limited |
 | YouTube comments | YouTube Data API | Daily quota applies |
@@ -305,20 +310,20 @@ Present failures honestly. It builds trust with judges.
 
 **Round 1 (presentation only):** this PRD, the architecture diagram, three example walkthroughs (fake scholarship, fake internship, task job), the test-set and metrics plan, and the privacy approach.
 
-**Round 2 is built layer by layer, bottom-up.** Each layer must pass its exit gate before the next starts. The full layer rules, dependency rules and gates are in ARCHITECTURE.md section 2.
+**Round 2 is built layer by layer, bottom-up, backend first.** Each layer must pass its exit gate before the next starts. The full layer rules, dependency rules and gates are in ARCHITECTURE.md section 2. UI pages are deferred until the backend passes its gates; the API routes and the live progress stream are part of the backend.
 
 | Layer | What it delivers | Exit gate |
 |---|---|---|
 | L0 Foundation | Project setup, env validation, logging, lint and test runner | Dev server, lint and tests run; missing env variables fail clearly |
-| L1 Contracts and data | Shared schemas and fixtures, database, state machine, cache | All fixtures validate; invalid data and transitions are rejected |
+| L1 Contracts and data | Shared schemas (including the case file), flag registry, fixtures, database, state machine, repositories, cache | All fixtures validate; invalid data and transitions are rejected; a case file snapshot can be assembled and rendered as markdown |
 | L2 Services | LLM layer, domain and payment tools, search and page fetch (with SSRF guard), YouTube comments, scam graph, classifier service | Mocked tests plus one real call per service; failures never throw |
-| L3 Decision | Scoring engine with hard rules and cannot_verify | Fixture tests give High, Low and Cannot verify as expected |
-| L4 Agents | The six agents and registry | Tests with mocked tools; every flag has evidence; failures become could_not_check |
-| L5 Pipeline | Extraction, orchestrator, report writer, progress events, cleanup job | A full check runs from the command line and produces a valid report |
-| L6 API and UI | Routes, live progress, pages for the whole user flow | Submit, confirm, progress and report work on mobile and desktop |
+| L3 Decision | Scoring engine with hard rules, cannot_verify and eligible-only confidence | Fixture tests give High, Low and Cannot verify as expected; skipped agents do not lower confidence |
+| L4 Agents | The six agents, each with a canRun rule, and the registry | Tests with mocked tools; canRun correct on all fixtures; every flag has evidence; failures become could_not_check; agents never write to the database |
+| L5 Pipeline | Extraction, the coordinator with its round loop, report writer, progress events, cleanup job | A full check runs from the command line, skips ineligible agents, uses rounds, and produces a valid report |
+| L6 API and UI | API routes and live progress stream (backend, first); pages for the whole user flow (UI, later) | Backend: routes and stream work end to end. UI: submit, confirm, progress and report work on mobile and desktop |
 | L7 Features and hardening | College email, fraud help, guides, feedback, rate limits, privacy cleanup, evaluation, demo script | Evaluation script runs, privacy checks pass, demo rehearsed |
 
-**Parallel tracks:** collecting the classifier dataset and the 50 to 100 case test set, seeding the graph and known-domains list, and building the UI against fixtures once L1 exists.
+**Parallel tracks:** collecting the classifier dataset and the 50 to 100 case test set, seeding the graph and known-domains list, and (later) building the UI against fixtures once L1 exists.
 
 If time is short, cut inside L7 and the optional parts of L4 (YouTube comments, extra OSINT), but keep L0 to L6, the classifier and the scam graph, since they carry the technical story.
 
@@ -335,7 +340,7 @@ If time is short, cut inside L7 and the optional parts of L4 (YouTube comments, 
 
 Open questions: exact time available before round 2, which LLM provider to start with, which regional languages to support first, and who owns the classifier work.
 
-## 21.  Round 1 presentation outline
+## 21. Round 1 presentation outline
 
 1. The problem, with real recent cases.
 2. Why existing tools fall short (a verdict without evidence, no student focus).
