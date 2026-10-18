@@ -91,7 +91,7 @@ Small functions, JSDoc on exported functions, explicit error handling, no dead c
 - Do only what the current task asks.
 - Work in small steps. After each step, run the code or tests and check the result.
 - If blocked or a requirement is ambiguous, stop and ask. Do not guess.
-- Write a failing test that reproduces a bug before fixing it.
+- Write the failing test that reproduces a bug before fixing it.
 - Keep README current.
 
 ## Definition of done
