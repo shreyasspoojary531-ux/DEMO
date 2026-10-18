@@ -22,7 +22,7 @@ The project is built bottom-up in layers (details in ARCHITECTURE.md section 2):
 - L7 Features and hardening
 
 ### Layer status (update this list when a gate passes)
-- [ ] L0 Foundation
+- [x] L0 Foundation
 - [ ] L1 Contracts and data
 - [ ] L2 Services
 - [ ] L3 Decision
