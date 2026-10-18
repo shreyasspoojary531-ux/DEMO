@@ -1,6 +1,6 @@
 # Architecture: Student Opportunity Verifier
 
-Companion to PRD.md · Draft v1 · 18 October 2026
+Companion to PRD.md · Draft v2 · 18 October 2026 (layered build method added in section 2)
 
 PRD.md defines what the product does. This file defines how it is built. Where they conflict, PRD.md wins on product behavior and this file wins on technical design.
 
@@ -14,7 +14,79 @@ PRD.md defines what the product does. This file defines how it is built. Where t
 6. **Provider-agnostic.** LLM, search and classifier sit behind small interfaces so any can be replaced.
 7. **Cache everything external.** Saves quota, speeds repeat checks, and makes demos reliable.
 
-## 2. System overview
+## 2. Layers and build method
+
+The system is built **layer by layer, bottom-up**. Each layer is finished, tested and demonstrated before the next one starts. This keeps errors close to where they start and makes every later layer easy to test against stable foundations.
+
+### 2.1 Layer map
+
+| Layer | Name | Contains | Depends on | Exit gate |
+|---|---|---|---|---|
+| L0 | Foundation | Repo, Next.js init, env validation, logging, lint, test runner, folder structure | nothing | Dev server, lint and tests run; missing env variables fail with a clear message |
+| L1 | Contracts and data | zod schemas for every shared shape (Check, Entity, Flag, AgentResult, ScoreResult, Report, progress events), fixtures for each, SQLite schema and migrations, state machine, cache | L0 | Every fixture validates; invalid data is rejected; invalid state transitions are rejected |
+| L2 | Services | LLM layer (`generate`), tools (domain, payments, search, fetchPage with SSRF guard, youtubeComments), scam graph, classifier service and client | L0, L1 | Each service has mocked tests plus a runnable script proving one real call; failures return error results and never throw |
+| L3 | Decision | Scoring engine: weights, hard rules, thresholds, confidence. Pure code | L1 | Fixture tests: clear scam gives High, genuine gives Low, thin evidence gives Cannot verify; every result lists the rules that fired |
+| L4 | Agents | Six agents (Message Analyst, Website Forensics, Official Verifier, Reputation / OSINT, Payment and Entity, plus the classifier client wrapper) and the agent registry | L1, L2 | Each agent passes tests with mocked tools and LLM; every flag has evidence; timeout and failure produce could_not_check |
+| L5 | Pipeline | Extraction (regex and vision), orchestrator, report writer, progress events, cleanup job | L1 to L4 | `scripts/run-check.js` runs a full check from the command line on fixtures and on a live example and produces a valid report |
+| L6 | API and UI | API routes, SSE stream, pages (landing, check, confirmation, progress, report, guides), components | L1, L5 | The full browser flow works on mobile and desktop: submit, confirm, progress, report |
+| L7 | Features and hardening | College email, fraud help, guide content, feedback, rate limiting, privacy cleanup, evaluation script, README, demo script | L6 | Evaluation script runs, privacy checks pass, demo rehearsed |
+
+### 2.2 Build order and runtime flow
+
+Build order is bottom-up: L0, L1, L2, L3, L4, L5, L6, L7.
+
+Runtime flow is top-down and passes through the same layers:
+
+```
+Browser
+  -> API routes ................................ L6
+      -> Pipeline: extraction .................. L5
+      -> Orchestrator .......................... L5
+          -> Agents (run in parallel) .......... L4
+              -> LLM, tools, graph, classifier . L2
+          <- agent results, validated by contracts (L1)
+      -> Scoring ............................... L3
+      -> Report writer (uses the LLM layer) .... L5
+      -> Database: checks, results, report ..... L1
+Browser <- report through the API and SSE ...... L6
+```
+
+Why bottom-up: the UI and pipeline are the most visible parts but depend on everything else. Building the stable layers first means each higher layer is tested against code that already works.
+
+### 2.3 Dependency rules
+
+1. A layer imports only from layers below it. Never upward.
+2. Only L1 (`lib/db`) touches the database. Agents and tools never read or write the database. The pipeline passes them a context and saves their results.
+3. Only the LLM layer talks to an LLM provider. Only L2 tools talk to external services.
+4. Agents never call each other. The orchestrator coordinates them.
+5. Scoring (L3) is pure: results in, score out. No I/O and no LLM.
+6. The UI talks only to API routes, never to agents or services.
+
+### 2.4 Contracts first
+
+Every shared shape lives in `lib/contracts/` as a zod schema with fixtures in `lib/contracts/fixtures/`. All layers validate data against these schemas at their boundaries. The UI can be built against the fixtures before the backend exists.
+
+Change control: a contract change is made in this file first, then in `lib/contracts/`, then in the layers that depend on it, with fixtures and tests updated in the same change.
+
+### 2.5 Layer gates
+
+A layer is complete only when all of these hold:
+
+1. Tests for the layer pass.
+2. A runnable script demonstrates the layer working (a real call for services, a fixture run for agents and scoring, a command-line check for the pipeline).
+3. Lint passes.
+4. Contracts are unchanged, or this file and the fixtures were updated first.
+5. The README and the layer status list in AGENTS.md are updated.
+
+No work on the next layer starts before the gate passes. A bug found in a later layer is fixed in the layer that owns it, with a test added there.
+
+### 2.6 Parallel tracks (do not block the layers)
+
+- **Data track:** collect the classifier dataset and the 50 to 100 case test set, fill the known-domains list and the graph seed file. Needed for real classifier metrics (L2) and the evaluation script (L7).
+- **UI track:** once the L1 fixtures exist, pages and components can be built against them while the backend layers continue.
+- **Keys and accounts track:** obtain the search API key and optional keys before the L2 search work.
+
+## 3. System overview
 
 ```
 Browser (Next.js UI)
@@ -40,7 +112,7 @@ External: LLM provider, search API, RDAP/DNS/crt.sh/Wayback,
           Safe Browsing, URLScan, YouTube Data API
 ```
 
-## 3. Components
+## 4. Components
 
 | Component | Responsibility | Location |
 |---|---|---|
@@ -55,10 +127,11 @@ External: LLM provider, search API, RDAP/DNS/crt.sh/Wayback,
 | Graph | Scam identifier graph read and write | `lib/graph.js` |
 | Classifier service | Train and serve the text classifier | `services/classifier/` |
 | DB | SQLite access, migrations, state machine | `lib/db/` |
+| Contracts | zod schemas and fixtures for every shared shape | `lib/contracts/` |
 | Cache | TTL cache over `lookup_cache` | `lib/cache.js` |
 | Env | The only place environment variables are read | `lib/env.js` |
 
-## 4. Technology
+## 5. Technology
 
 | Layer | Choice | Notes |
 |---|---|---|
@@ -71,7 +144,7 @@ External: LLM provider, search API, RDAP/DNS/crt.sh/Wayback,
 | LLM | Provider chosen by env | Must support image input |
 | Search | Provider chosen by env | Google Programmable Search, Brave Search or similar |
 
-## 5. Repository layout
+## 6. Repository layout
 
 ```
 /
@@ -93,6 +166,7 @@ External: LLM provider, search API, RDAP/DNS/crt.sh/Wayback,
       guides/
   lib/
     env.js
+    contracts/            zod schemas and fixtures for every shared shape
     cache.js
     extract.js
     orchestrator.js
@@ -111,13 +185,14 @@ External: LLM provider, search API, RDAP/DNS/crt.sh/Wayback,
     requirements.txt
   scripts/
     smoke.js
+    run-check.js          runs a full check from the command line
     seedGraph.js
     evaluate.js
   docs/
   data/                   app.db (gitignored)
 ```
 
-## 6. Check lifecycle
+## 7. Check lifecycle
 
 State machine (invalid transitions are rejected in `lib/db`):
 
@@ -140,7 +215,7 @@ Sequence:
 6. The report writer produces the explanation and checklist from the evidence only.
 7. The report is saved and the status becomes `report_ready`.
 
-## 7. Data model
+## 8. Data model
 
 | Table | Columns |
 |---|---|
@@ -156,7 +231,7 @@ Sequence:
 
 A cleanup job runs on startup and hourly: deletes expired checks and everything attached to them. Graph rows and feedback persist. Feedback stores no check content.
 
-## 8. LLM layer
+## 9. LLM layer
 
 Interface: `generate({ system, prompt, images, schema })` returns data validated by the zod `schema`.
 
@@ -167,7 +242,7 @@ Interface: `generate({ system, prompt, images, schema })` returns data validated
 - Prompts never include secrets. Logs never include prompt or response bodies.
 - Keep calls few: one call per agent that needs one, plus extraction per image and one report call.
 
-## 9. Tools layer
+## 10. Tools layer
 
 Plain async functions that return structured results and never throw (they return an error field instead). Suggested starting cache TTLs:
 
@@ -186,7 +261,7 @@ Plain async functions that return structured results and never throw (they retur
 
 `fetchPage` protections: allow only http and https, resolve and block private, loopback and link-local addresses (including after redirects), enforce a timeout and a response size limit, strip scripts and return plain text.
 
-## 10. Agents
+## 11. Agents
 
 Contract shared by all agents:
 
@@ -214,7 +289,7 @@ Registry: `lib/agents/index.js` exports a list of `{ name, run(context) }`. Addi
 
 The orchestrator emits events: `{ type: "agent", agent, status: "started"|"done"|"could_not_check", summary }`, `{ type: "stage", stage }` and `{ type: "complete" }`.
 
-## 11. Scoring
+## 12. Scoring
 
 Pure code in `lib/scoring/score.js`, configured by one file (`lib/scoring/config.js`) so weights can be tuned against the test set.
 
@@ -227,41 +302,41 @@ Pure code in `lib/scoring/score.js`, configured by one file (`lib/scoring/config
 
 The function returns the score, level, confidence and the list of rules and flags that contributed, so every result is explainable.
 
-## 12. Report writer
+## 13. Report writer
 
 One `generate()` call. Input: the agents' evidence and the scoring result only. Output (zod-validated): summary in the chosen language, scam type guess, flags with plain-language explanations and sources, verified items, could-not-check items, a step-by-step checklist (including manual registry links), actions and disclaimer. The prompt forbids inventing facts and requires saying so when evidence is thin.
 
-## 13. Classifier service
+## 14. Classifier service
 
 - **Training:** `train.py` builds TF-IDF features (word and character n-grams), fits logistic regression on a stratified 80/20 split with a fixed seed, prints precision, recall, F1 and the confusion matrix, and saves `model.joblib` and `metrics.json`.
 - **Serving:** `app.py` (FastAPI) exposes `POST /classify` (returns label, probability and top terms) and `GET /health`.
 - **Client:** `lib/classifier.js` calls the service with a short timeout. If it fails, the classifier simply contributes nothing.
 - **Data:** the starter dataset is synthetic and only for pipeline testing. Real, sourced data must replace it before any metric is reported.
 
-## 14. Scam graph
+## 15. Scam graph
 
 - **Write policy:** only from High-risk reports, only with explicit consent, only identifiers.
 - **Operations:** `upsertNode`, `link`, `lookup(identifier)` returning earlier report counts and linked identifiers.
 - **Use in a check:** the Payment and Entity agent looks up every UPI ID, domain, handle and phone number. A match emits a hard-rule flag showing linked identifiers.
 - **Seeding:** `scripts/seedGraph.js` loads `lib/data/seed-graph.json`, which must be filled from public advisories.
 
-## 15. API surface
+## 16. API surface
 
 The routes and payloads are defined in PRD.md section 6. Technical notes:
 
 - Route handlers validate input with zod and return `{ error, code }` with user-safe messages.
-- `GET /api/checks/:id/stream` uses Server-Sent Events with the event shapes in section 10. The client falls back to polling `GET /api/checks/:id` if the stream drops.
+- `GET /api/checks/:id/stream` uses Server-Sent Events with the event shapes in section 11. The client falls back to polling `GET /api/checks/:id` if the stream drops.
 - Rate limiting is per IP on check creation (in-memory is enough for the demo).
 - A check can be read only by its id. Ids are long random strings.
 
-## 16. Frontend
+## 17. Frontend
 
 - **Pages:** as listed in PRD.md section 4. `/check/[id]` renders one of three views based on the check status: confirmation editor, live progress timeline, final report.
 - **State:** server state fetched per check, SSE for progress. No global state library needed.
 - **Design:** tokens for color, type scale, spacing, radius and dark mode defined once. UI work follows the skills in `.agents/` (frontend design and Apple design among them). Mobile-first, accessible, readable on low-end phones.
 - **Rendering untrusted text:** user and fetched text is always rendered as plain text, never as HTML.
 
-## 17. Security and privacy
+## 18. Security and privacy
 
 | Threat | Control |
 |---|---|
@@ -276,7 +351,7 @@ The routes and payloads are defined in PRD.md section 6. Technical notes:
 
 The design takes India's Digital Personal Data Protection Act, 2023 into account (minimum data, stated purpose, deletion). Get proper legal advice before any public launch.
 
-## 18. Reliability and performance
+## 19. Reliability and performance
 
 - Per-agent timeout 25 seconds. Whole pipeline target under 60 seconds.
 - Agents run in parallel, so total time is roughly the slowest agent.
@@ -284,15 +359,16 @@ The design takes India's Digital Personal Data Protection Act, 2023 into account
 - Every agent degrades independently. The report lists what could not be checked.
 - Retries only for transient network errors, with a small limit.
 
-## 19. Testing and observability
+## 20. Testing and observability
 
 - **Unit tests:** scoring (weights, hard rules, thresholds, cannot_verify), entity regex extraction, UPI and phone validators, SSRF guard, state machine.
 - **Agent tests:** mocked tools and mocked `generate()` with fixed fixtures, checking that flags always include evidence.
 - **Smoke test:** `scripts/smoke.js` creates a check, fetches it, and calls `generate()` if keys are set.
 - **Evaluation:** `scripts/evaluate.js` runs labeled cases through the full pipeline and prints agreement, a confusion table and failures.
 - **Logging:** structured logs with check id, stage, agent, duration and status. No user content, no secrets.
+- **Layer gates:** no layer is complete until its tests pass and a runnable script demonstrates it (section 2.5).
 
-## 20. Configuration
+## 21. Configuration
 
 | Variable | Required | Purpose |
 |---|---|---|
@@ -307,7 +383,7 @@ The design takes India's Digital Personal Data Protection Act, 2023 into account
 | `CLASSIFIER_URL` | later | Python classifier service address |
 | `DB_PATH` | optional | SQLite file, default `./data/app.db` |
 
-## 21. Extension points
+## 22. Extension points
 
 - New agent: one file in `lib/agents/` plus a registry entry.
 - New LLM or search provider: one adapter behind the existing interface.
@@ -315,7 +391,7 @@ The design takes India's Digital Personal Data Protection Act, 2023 into account
 - Later channels: browser extension or WhatsApp bot calling the same API.
 - Moving to Postgres: reimplement `lib/db` and `lib/cache.js` only.
 
-## 22. Open decisions
+## 23. Open decisions
 
 - LLM provider and model for the first build.
 - Search provider and its free quota.

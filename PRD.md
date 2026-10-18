@@ -303,20 +303,24 @@ Present failures honestly. It builds trust with judges.
 
 ## 19. Build plan
 
-**Round 1 (presentation only):** this PRD, an architecture diagram, three example walkthroughs (fake scholarship, fake internship, task job), the test-set and metrics plan, and the privacy approach.
+**Round 1 (presentation only):** this PRD, the architecture diagram, three example walkthroughs (fake scholarship, fake internship, task job), the test-set and metrics plan, and the privacy approach.
 
-**Round 2 milestones, in order:**
+**Round 2 is built layer by layer, bottom-up.** Each layer must pass its exit gate before the next starts. The full layer rules, dependency rules and gates are in ARCHITECTURE.md section 2.
 
-1. Foundation: project setup, database, LLM wrapper, landing page.
-2. Input form, screenshot extraction and the confirmation step.
-3. Message Analyst, orchestrator and live progress.
-4. Website Forensics and Payment and Entity agents.
-5. Official Verifier and Reputation agents.
-6. Scoring engine, report writer and the report page.
-7. Classifier with training notebook and metrics (data collection starts on day one, in parallel), and the scam graph with seeded data.
-8. College email, "I already paid" help, guides, feedback, privacy cleanup, evaluation script.
+| Layer | What it delivers | Exit gate |
+|---|---|---|
+| L0 Foundation | Project setup, env validation, logging, lint and test runner | Dev server, lint and tests run; missing env variables fail clearly |
+| L1 Contracts and data | Shared schemas and fixtures, database, state machine, cache | All fixtures validate; invalid data and transitions are rejected |
+| L2 Services | LLM layer, domain and payment tools, search and page fetch (with SSRF guard), YouTube comments, scam graph, classifier service | Mocked tests plus one real call per service; failures never throw |
+| L3 Decision | Scoring engine with hard rules and cannot_verify | Fixture tests give High, Low and Cannot verify as expected |
+| L4 Agents | The six agents and registry | Tests with mocked tools; every flag has evidence; failures become could_not_check |
+| L5 Pipeline | Extraction, orchestrator, report writer, progress events, cleanup job | A full check runs from the command line and produces a valid report |
+| L6 API and UI | Routes, live progress, pages for the whole user flow | Submit, confirm, progress and report work on mobile and desktop |
+| L7 Features and hardening | College email, fraud help, guides, feedback, rate limits, privacy cleanup, evaluation, demo script | Evaluation script runs, privacy checks pass, demo rehearsed |
 
-If time is short, cut from the bottom, but keep the classifier and the graph since they carry the technical story.
+**Parallel tracks:** collecting the classifier dataset and the 50 to 100 case test set, seeding the graph and known-domains list, and building the UI against fixtures once L1 exists.
+
+If time is short, cut inside L7 and the optional parts of L4 (YouTube comments, extra OSINT), but keep L0 to L6, the classifier and the scam graph, since they carry the technical story.
 
 ## 20. Risks and open questions
 
